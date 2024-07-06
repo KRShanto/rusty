@@ -1,127 +1,103 @@
-use dotenv::dotenv;
-use hyper::{body::Buf, header, Body, Client, Request};
-use hyper_tls::HttpsConnector;
-use serde_derive::{Deserialize, Serialize};
-use std::env;
+use clap::Parser;
+use cli::{Cli, Commands};
+use dirs;
+use openai::{openai_query, Config, OpenAIQuery};
 use std::error::Error;
-use std::io::{stdin, stdout, Write};
 
-#[derive(Serialize, Deserialize, Debug)]
-struct OpenAIChoiceMessage {
-    role: String,
-    content: String,
-}
+mod cli;
+mod openai;
 
-#[derive(Deserialize, Debug)]
-struct OpenAIChoices {
-    message: OpenAIChoiceMessage,
-}
-
-#[derive(Deserialize, Debug)]
-struct OpenAIResponse {
-    choices: Vec<OpenAIChoices>,
-}
-
-#[derive(Serialize, Debug)]
-struct OpenAIRequest {
-    model: String,
-    messages: Vec<OpenAIChoiceMessage>,
-}
-
-const URI: &str = "https://api.openai.com/v1/chat/completions";
+const CONFIG_FILE: &str = "config.json";
+// const History_FILE: &str = "history.json";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
-    dotenv().ok();
+    let args = Cli::parse();
 
-    // Check for environment variable OPENAI_API_KEY
-    let api_key = match env::var("OPENAI_API_KEY") {
-        Ok(key) => key,
-        Err(_) => {
-            println!("Error: missing environment variable OPENAI_API_KEY");
-            std::process::exit(1);
+    match args.command {
+        Some(commands) => match commands {
+            Commands::Query { query } => {
+                let config_path = get_config_path();
+
+                // check if config file exists
+                if !config_path.exists() {
+                    println!(
+                        "Config file not found. Please run `{} setup` to create one.",
+                        env!("CARGO_PKG_NAME")
+                    );
+                    return Ok(());
+                }
+
+                // read config file
+                let config = std::fs::read_to_string(config_path)?;
+
+                match serde_json::from_str::<Config>(&config) {
+                    Ok(config) => {
+                        println!("Config: {:#?}", config);
+
+                        let response = openai_query(OpenAIQuery {
+                            query,
+                            api_key: config.api_key,
+                            model: config.model,
+                        })
+                        .await?;
+
+                        println!("{}", response);
+                    }
+                    Err(_) => {
+                        println!("Error: could not parse config file. Run `{} setup` to create another config file.", env!("CARGO_PKG_NAME"));
+                    }
+                }
+            }
+            Commands::Setup => {
+                // user input for api key and model name
+                println!("Please enter your OpenAI API key:");
+                let mut api_key = String::new();
+                std::io::stdin().read_line(&mut api_key).unwrap();
+
+                println!("Please enter the model name:");
+                let mut model = String::new();
+                std::io::stdin().read_line(&mut model).unwrap();
+
+                // remove leading/trailing whitespaces
+                let api_key = api_key.trim().to_string();
+                let model = model.trim().to_string();
+
+                // check if the value is empty
+                if api_key.is_empty() || model.is_empty() {
+                    println!("Error: API key or model name cannot be empty");
+                    return Ok(());
+                }
+
+                // create config file
+                let config = Config { api_key, model };
+
+                let config_path = get_config_path();
+
+                println!("Creating config file at: {}", config_path.display());
+
+                // create the directory if it doesn't exist
+                if !config_path.parent().unwrap().exists() {
+                    std::fs::create_dir_all(config_path.parent().unwrap())?;
+                }
+
+                // create config file
+                std::fs::write(&config_path, serde_json::to_string_pretty(&config)?)?;
+
+                println!("Config file created at: {}", config_path.display());
+            }
+        },
+        None => {
+            println!("No command provided");
         }
-    };
-
-    // take the model from env, if not provided use the default
-    let model = match env::var("OPENAI_MODEL") {
-        Ok(model) => model,
-        Err(_) => String::from("gpt-3.5-turbo"),
-    };
-
-    let https = HttpsConnector::new();
-    let client = Client::builder().build(https);
-
-    let user_input = env::args().skip(1).collect::<Vec<String>>().join(" ");
-
-    // If no arguments were provided, ask for user input
-    let user_input = if user_input.is_empty() {
-        print!("Enter prompt: ");
-        let _ = stdout().flush();
-        let mut input = String::new();
-        stdin()
-            .read_line(&mut input)
-            .expect("Failed to read prompt.");
-        input
-    } else {
-        user_input
-    };
-
-    let auth_header_val = format!("Bearer {}", api_key);
-
-    let openai_request = OpenAIRequest {
-        model,
-        messages: vec![
-            OpenAIChoiceMessage {
-                role: "system".to_string(),
-                content: String::from("You are bash command generator. Only return the command."),
-            },
-            OpenAIChoiceMessage {
-                role: "user".to_string(),
-                content: String::from("How to list contents of a directory in bash?"),
-            },
-            OpenAIChoiceMessage {
-                role: "assistant".to_string(),
-                content: "ls".to_string(),
-            },
-            OpenAIChoiceMessage {
-                role: "user".to_string(),
-                content: user_input.trim().to_string(),
-            },
-        ],
-    };
-
-    let body = Body::from(serde_json::to_vec(&openai_request)?);
-
-    let req = Request::post(URI)
-        .header(header::CONTENT_TYPE, "application/json")
-        .header("Authorization", &auth_header_val)
-        .body(body)
-        .unwrap();
-
-    let res = client.request(req).await?;
-
-    let body = hyper::body::aggregate(res).await?;
-
-    let json: OpenAIResponse = match serde_json::from_reader(body.reader()) {
-        Ok(response) => response,
-        Err(e) => {
-            println!("Error: check environment variable OPENAI_API_KEY or try again later");
-            println!("Error: {}", e);
-            std::process::exit(1);
-        }
-    };
-
-    let bash = json.choices[0]
-        .message
-        .content
-        .lines()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    println!("{}", bash);
+    }
 
     Ok(())
+}
+
+fn get_config_path() -> std::path::PathBuf {
+    let config_dir = dirs::config_dir().expect("Could not find the configuration directory");
+    config_dir
+        .join(format!(".{}", env!("CARGO_PKG_NAME")))
+        .join(CONFIG_FILE)
 }
