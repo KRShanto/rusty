@@ -13,4 +13,6 @@ pub enum Commands {
     Query { query: String },
     /// Setup the configuration file
     Setup,
+    /// Show the history of queries
+    History,
 }

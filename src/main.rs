@@ -5,10 +5,10 @@ use openai::{openai_query, Config, OpenAIQuery};
 use std::error::Error;
 
 mod cli;
+mod history;
 mod openai;
 
 const CONFIG_FILE: &str = "config.json";
-// const History_FILE: &str = "history.json";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -36,13 +36,16 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                         println!("Config: {:#?}", config);
 
                         let response = openai_query(OpenAIQuery {
-                            query,
+                            query: query.to_string(),
                             api_key: config.api_key,
                             model: config.model,
                         })
                         .await?;
 
                         println!("{}", response);
+
+                        // save to history
+                        history::save(query, response).unwrap();
                     }
                     Err(_) => {
                         println!("Error: could not parse config file. Run `{} setup` to create another config file.", env!("CARGO_PKG_NAME"));
@@ -85,6 +88,27 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 std::fs::write(&config_path, serde_json::to_string_pretty(&config)?)?;
 
                 println!("Config file created at: {}", config_path.display());
+            }
+            Commands::History => {
+                let history = history::list().unwrap();
+
+                if history.is_empty() {
+                    println!("No history found");
+                    return Ok(());
+                }
+
+                for (index, h) in history.iter().enumerate() {
+                    println!("Index: {}", index);
+                    println!("Query: {}", h.query);
+                    println!("Response: {}", h.response);
+                    println!(
+                        "Timestamp: {}",
+                        chrono::DateTime::parse_from_rfc3339(&h.timestamp)
+                            .unwrap()
+                            .format("%b %d, %Y %I:%M %p")
+                    );
+                    println!();
+                }
             }
         },
         None => {
